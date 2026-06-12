@@ -53,4 +53,9 @@
  *.toml.bak
 
 
+__pycache__/
+*.pyc
+.claude/
+
+
 openspec/
