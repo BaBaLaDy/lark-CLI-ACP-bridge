@@ -108,6 +108,80 @@ def parse_prefix_routing(text: str, known_agents: set[str]) -> tuple[str | None,
 
 
 # --------------------------------------------------------------------------- #
+# Doc-comment helpers (drive.notice.comment_add_v1)
+# --------------------------------------------------------------------------- #
+
+def _build_comment_prompt(
+    file_token: str,
+    file_type: str,
+    question: str,
+    quote: str | None,
+    is_whole: bool = False,
+) -> str:
+    """Build the agent prompt for a doc comment @mention.
+
+    Mirrors lark-coding-agent-bridge's ``buildCommentPrompt``: the prompt tells
+    the agent which document to read, provides the user's selected text (for
+    inline comments), the question, and instructions to output plain text only.
+    """
+    doc_url = f"https://feishu.cn/{file_type}/{file_token}"
+    parts = [
+        "我在飞书云文档里被 @了。文档信息：",
+        f"- 链接：{doc_url}",
+        f"- file_token：{file_token}",
+        f"- 类型：{file_type}",
+        f"- 评论范围：{'全文评论（针对整篇）' if is_whole else '行内评论（针对选中文字）'}",
+    ]
+    if quote:
+        parts += ["", f"用户选中的原文：\n> {quote.replace(chr(10), chr(10) + '> ')}"]
+    parts += [
+        "",
+        f"用户的问题：{question}",
+        "",
+        _comment_read_instruction(file_type, file_token),
+        "",
+        "评论回复由 bridge 负责：不要调用云文档评论或回复接口，也不要给评论添加或删除 reaction；最终答案直接用纯文本交给 bridge。",
+        "",
+        "回复要求：直接用纯文本，不要 markdown（不要 ** __ # - * > ` 之类的标记），不要代码块；云文档评论框不渲染 markdown，会原样显示这些符号。",
+    ]
+    return "\n".join(parts)
+
+
+def _comment_read_instruction(file_type: str, file_token: str) -> str:
+    """Return the agent-facing instruction for how to read the document."""
+    if file_type in ("doc", "docx"):
+        return (
+            "读取文档内容：优先使用当前 docs v2 读取命令：\n"
+            f"  `lark-cli docs +fetch --api-version v2 --doc {file_token} --doc-format markdown`\n"
+            "如果本机 lark-cli 不支持上述参数，不要在同一错误上反复重试；使用当前可用的等价读取命令读取同一 file_token。"
+        )
+    if file_type == "sheet":
+        return "读取表格内容：这是 sheet 类型，不要使用 docs +fetch。请按当前可用的表格读取工具读取同一 file_token。"
+    return "读取文件内容：这是 file 类型，请按当前可用的云空间文件读取工具处理同一 file_token。"
+
+
+def _strip_comment_markdown(s: str) -> str:
+    """Remove markdown markers so doc comment plain-text doesn't show literal symbols.
+
+    Conservative — only touches bold, italic, headings, blockquote, list bullets,
+    inline code, and fenced code blocks.  Mirrors the TS ``stripMarkdown``.
+    """
+    import re
+
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.MULTILINE)         # headings
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)                     # bold **
+    s = re.sub(r"__([^_]+)__", r"\1", s)                         # bold __
+    s = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\w)", r"\1", s)       # italic *
+    s = re.sub(r"(?<![_\w])_([^_\n]+)_(?!\w)", r"\1", s)         # italic _
+    s = re.sub(r"`([^`]+)`", r"\1", s)                           # inline code
+    s = re.sub(r"^[-*]\s+", "", s, flags=re.MULTILINE)            # list bullets
+    s = re.sub(r"^>\s?", "", s, flags=re.MULTILINE)               # blockquote
+    s = re.sub(r"```[a-zA-Z]*\n?", "", s)                         # fenced code open
+    s = re.sub(r"```", "", s)                                     # fenced code close
+    return s
+
+
+# --------------------------------------------------------------------------- #
 # Throttled card updater
 # --------------------------------------------------------------------------- #
 
@@ -332,6 +406,50 @@ class FeishuBot:
             )
         except AttributeError:
             pass  # SDK version doesn't have these methods; errors will remain but are harmless
+
+        # Register handler for drive doc comment events (bot @mentioned in a cloud document).
+        # Uses register_p2_customized_event since the SDK builder has no typed method for
+        # drive.notice.comment_add_v1.  Falls back to a no-op injection for older SDKs.
+        try:
+            from lark_oapi import CustomizedEvent
+
+            def on_comment_add(data: CustomizedEvent) -> None:
+                if self._loop is None:
+                    return
+                raw_event: dict = data.event or {}
+                future = asyncio.run_coroutine_threadsafe(
+                    self._handle_doc_comment_event(raw_event), self._loop
+                )
+
+                def log_comment_failure(done_future: Any) -> None:
+                    exc = done_future.exception()
+                    if exc:
+                        logger.error("ws-comment-handler-failed", error=str(exc), exc_info=exc)
+
+                future.add_done_callback(log_comment_failure)
+
+            handler_builder = handler_builder.register_p2_customized_event(
+                "drive.notice.comment_add_v1", on_comment_add
+            )
+        except AttributeError:
+            # Older SDK versions without register_p2_customized_event: fall back to no-op
+            # injection so the "processor not found" log doesn't spam.
+            handler = handler_builder.build()
+            try:
+                from lark_oapi.event.processor import IEventProcessor
+
+                class _NoOpProcessor(IEventProcessor):
+                    def type(self):
+                        return dict
+
+                    def do(self, data: dict) -> None:
+                        pass
+
+                if "p2.drive.notice.comment_add_v1" not in handler._processorMap:
+                    handler._processorMap["p2.drive.notice.comment_add_v1"] = _NoOpProcessor()
+            except Exception:
+                pass
+            return handler
 
         return handler_builder.build()
 
@@ -1447,6 +1565,262 @@ class FeishuBot:
         response = self.client.im.v1.message_reaction.delete(request)
         if not response.success():
             logger.warning("remove-reaction-failed", code=response.code, msg=response.msg)
+
+    # ------------------------------------------------------------------ #
+    # Drive doc comment handling
+    # ------------------------------------------------------------------ #
+
+    # Supported file types for comment fetching (others use different APIs)
+    _COMMENT_SUPPORTED_FILE_TYPES = frozenset({"doc", "docx", "sheet", "file"})
+    _COMMENT_REPLY_MAX_CHARS = 2000
+
+    async def _handle_doc_comment_event(self, raw_event: dict[str, Any]) -> None:
+        """Handle drive.notice.comment_add_v1: bot @mentioned in a doc comment.
+
+        Fetches the comment text, runs the agent, and posts a plain-text reply
+        in the comment thread.  Mirrors the flow of lark-coding-agent-bridge's
+        comments.ts but without streaming card updates (doc comments have none).
+        """
+        # 1. Parse key fields from raw event dict.
+        #    The wire format has fields at the top level and/or in notice_meta.
+        notice_meta: dict = raw_event.get("notice_meta") or {}
+        file_token = raw_event.get("file_token") or notice_meta.get("file_token", "")
+        file_type = raw_event.get("file_type") or notice_meta.get("file_type", "")
+        comment_id = raw_event.get("comment_id", "")
+        reply_id = raw_event.get("reply_id") or notice_meta.get("reply_id") or None
+
+        from_user = notice_meta.get("from_user_id") or raw_event.get("user_id") or {}
+        operator_open_id = from_user.get("open_id", "")
+
+        is_mentioned = (
+            raw_event.get("is_mentioned")
+            or notice_meta.get("is_mentioned")
+            or raw_event.get("is_mention")
+            or False
+        )
+
+        logger.info(
+            "doc-comment-event",
+            file_type=file_type,
+            comment_id=comment_id,
+            reply_id=reply_id,
+            mentioned=is_mentioned,
+            operator=operator_open_id,
+        )
+
+        # 2. Guard: only handle @mentions of the bot.
+        if not is_mentioned:
+            logger.info("doc-comment-skip", reason="not-mentioned")
+            return
+
+        # 3. Guard: only supported file types.
+        if file_type not in self._COMMENT_SUPPORTED_FILE_TYPES:
+            logger.info("doc-comment-skip", reason="unsupported-file-type", file_type=file_type)
+            return
+
+        if not file_token or not comment_id:
+            logger.warning("doc-comment-skip", reason="missing-fields")
+            return
+
+        # 4. Dedup — same reply within the TTL window is treated as a replay.
+        dedup_key = f"doc-comment:{file_token}:{comment_id}:{reply_id or ''}"
+        if self._is_duplicate(dedup_key):
+            logger.debug("doc-comment-duplicate-skipped", key=dedup_key)
+            return
+
+        # 5. Fetch comment text and quoted selection from Feishu.
+        question, quote = await self._fetch_comment_text(file_token, file_type, comment_id, reply_id)
+        if not question:
+            logger.info("doc-comment-skip", reason="empty-question")
+            return
+
+        # 6. Build the agent prompt.
+        #    is_whole=True when there is no reply_id (top-level comment on the whole doc).
+        prompt = _build_comment_prompt(file_token, file_type, question, quote, is_whole=not reply_id)
+
+        # 7. Use operator's open_id as the agent user scope (same key as IM messages).
+        user_id = operator_open_id or "doc-comment-user"
+
+        # 8. Run agent and collect the final text answer.
+        answer = await self._run_agent_for_comment(user_id, prompt)
+
+        # 9. Strip markdown (doc comment boxes do not render markdown).
+        answer = _strip_comment_markdown(answer.strip())
+        if not answer:
+            answer = "（无回复内容）"
+        if len(answer) > self._COMMENT_REPLY_MAX_CHARS:
+            answer = answer[: self._COMMENT_REPLY_MAX_CHARS - 1] + "…"
+
+        # 10. Post the reply in the comment thread.
+        await self._post_comment_reply(file_token, file_type, comment_id, answer)
+
+    async def _fetch_comment_text(
+        self,
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        reply_id: str | None,
+    ) -> tuple[str, str | None]:
+        """Fetch the comment question text and quoted selection from Feishu.
+
+        Returns (question, quote) where quote is the selected text for inline
+        comments (or None for whole-doc comments).
+        """
+        try:
+            from lark_oapi.api.drive.v1 import GetFileCommentRequest
+
+            request = (
+                GetFileCommentRequest.builder()
+                .file_type(file_type)
+                .file_token(file_token)
+                .comment_id(comment_id)
+                .build()
+            )
+            response = self.client.drive.v1.file_comment.get(request)
+            if not response.success():
+                logger.warning("fetch-comment-failed", code=response.code, msg=response.msg)
+                return "", None
+
+            comment = response.data.comment if response.data else None
+            if not comment:
+                return "", None
+
+            # Extract quote (selected text for inline comments).
+            quote: str | None = getattr(comment, "quote", None)
+
+            # Locate the reply that triggered the event (or fall back to the last reply).
+            reply_list = getattr(comment, "reply_list", None)
+            replies: list = getattr(reply_list, "replies", []) or [] if reply_list else []
+
+            target_reply = None
+            if reply_id and replies:
+                target_reply = next(
+                    (r for r in replies if getattr(r, "reply_id", None) == reply_id),
+                    None,
+                )
+            if target_reply is None and replies:
+                target_reply = replies[-1]
+            if target_reply is None:
+                return "", quote
+
+            # Extract text content from reply elements (text_run / docs_link only).
+            content = getattr(target_reply, "content", None)
+            elements: list = getattr(content, "elements", []) or [] if content else []
+            parts: list[str] = []
+            for el in elements:
+                el_type = getattr(el, "type", "")
+                if el_type == "text_run":
+                    text_run = getattr(el, "text_run", None)
+                    if text_run:
+                        parts.append(getattr(text_run, "text", "") or "")
+                elif el_type == "docs_link":
+                    docs_link = getattr(el, "docs_link", None)
+                    if docs_link:
+                        parts.append(getattr(docs_link, "url", "") or "")
+                # "person" elements (the @bot mention itself) are intentionally skipped.
+            question = "".join(parts).strip()
+            return question, quote
+
+        except Exception as exc:
+            logger.error("fetch-comment-error", error=str(exc), exc_info=True)
+            return "", None
+
+    async def _run_agent_for_comment(self, user_id: str, prompt: str) -> str:
+        """Run the ACP agent for a doc comment and return the final text answer."""
+        state: SessionState | None = None
+
+        def on_state_change(s: SessionState) -> None:
+            nonlocal state
+            state = s
+
+        try:
+            if self._agent_manager is not None:
+                agent_name = self._resolve_agent_name(user_id, "", "p2p")
+                state = await asyncio.wait_for(
+                    self._agent_manager.chat(
+                        message=prompt,
+                        agent_name=agent_name,
+                        user_id=user_id,
+                        on_state_change=on_state_change,
+                    ),
+                    timeout=float(self._settings.idle_timeout_seconds),
+                )
+            else:
+                state = await asyncio.wait_for(
+                    self.codex_bridge.chat(
+                        message=prompt,
+                        user_id=user_id,
+                        on_state_change=on_state_change,
+                    ),
+                    timeout=float(self._settings.idle_timeout_seconds),
+                )
+        except asyncio.TimeoutError:
+            logger.warning("doc-comment-agent-timeout", user_id=user_id)
+            return "⏱️ 任务超时，请重新 @ 我。"
+        except Exception as exc:
+            logger.error("doc-comment-agent-error", error=str(exc), exc_info=True)
+            return f"⚠️ 处理失败：{exc}"
+
+        return state.full_text if state and state.full_text else ""
+
+    async def _post_comment_reply(
+        self,
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        text: str,
+    ) -> None:
+        """Post a plain-text reply to a doc comment thread via drive.v1.file_comment.create."""
+        try:
+            from lark_oapi.api.drive.v1 import CreateFileCommentRequest
+            from lark_oapi.api.drive.v1.model import (
+                FileComment,
+                FileCommentReply,
+                ReplyContent,
+                ReplyElement,
+                ReplyList,
+                TextRun,
+            )
+
+            reply = (
+                FileCommentReply.builder()
+                .content(
+                    ReplyContent.builder()
+                    .elements([
+                        ReplyElement.builder()
+                        .type("text_run")
+                        .text_run(TextRun.builder().text(text).build())
+                        .build()
+                    ])
+                    .build()
+                )
+                .build()
+            )
+            body = (
+                FileComment.builder()
+                .reply_list(ReplyList.builder().replies([reply]).build())
+                .build()
+            )
+            request = (
+                CreateFileCommentRequest.builder()
+                .file_type(file_type)
+                .file_token(file_token)
+                .request_body(body)
+                .build()
+            )
+            response = self.client.drive.v1.file_comment.create(request)
+            if not response.success():
+                logger.error(
+                    "post-comment-reply-failed",
+                    code=response.code,
+                    msg=response.msg,
+                    file_token=file_token,
+                    comment_id=comment_id,
+                )
+            else:
+                logger.info("post-comment-reply-sent", file_token=file_token, comment_id=comment_id)
+        except Exception as exc:
+            logger.error("post-comment-reply-error", error=str(exc), exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Graceful shutdown

@@ -16,7 +16,8 @@
       "PowerShell(& \"C:\\\\Users\\\\admin\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@anthropic-ai\\\\claude-code\\\\bin\\\\claude.exe\" --version 2>&1)",
       "PowerShell(& \"C:\\\\Users\\\\admin\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@anthropic-ai\\\\claude-code\\\\bin\\\\claude.exe\" --help 2>&1)",
       "Skill(claude-api)",
-      "Skill(claude-api:*)"
+      "Skill(claude-api:*)",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('src/lark_acp_bridge/bot/feishu_bot.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
     ]
   }
 }
