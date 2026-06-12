@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import signal
+import subprocess
 import sys
 from pathlib import Path
+from shutil import which
 
 import structlog
 import typer
@@ -25,32 +28,245 @@ daemon_app = typer.Typer(name="daemon", help="管理系统服务（可选 daemon
 app.add_typer(daemon_app)
 
 
+# ---------------------------------------------------------------------------
+# Agent presets for the interactive init wizard
+# ---------------------------------------------------------------------------
+
+_AGENT_PRESETS: list[dict] = [
+    {
+        "label": "Claude Code     （需要 Anthropic API Key）",
+        "name": "claude",
+        "command": "claude-agent-acp",
+        "npm_pkg": "@agentclientprotocol/claude-agent-acp",
+        "env_key": "ANTHROPIC_API_KEY",
+        "env_prompt": "ANTHROPIC_API Key（sk-ant-...）",
+        "args": [],
+        "description": "Claude Code",
+    },
+    {
+        "label": "OpenCode        （multi-provider，npm 全局安装）",
+        "name": "opencode",
+        "command": "opencode",
+        "npm_pkg": "opencode-ai",
+        "env_key": None,
+        "env_prompt": "",
+        "args": ["acp"],
+        "description": "OpenCode (multi-provider)",
+    },
+    {
+        "label": "Codex (npx)     （需要 OpenAI API Key，npx 自动下载无需手动安装）",
+        "name": "codex",
+        "command": "npx",
+        "npm_pkg": None,
+        "env_key": "OPENAI_API_KEY",
+        "env_prompt": "OPENAI API Key（sk-...）",
+        "args": ["-y", "@zed-industries/codex-acp"],
+        "description": "Codex CLI",
+    },
+]
+
+
+def _run_check(cmd: list[str], timeout: int = 5) -> str | None:
+    """Run a command and return stripped stdout, or None on failure."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def _check_node() -> bool:
+    """Check Node.js availability and print result. Returns True if node is available."""
+    node_ver = _run_check(["node", "--version"])
+    npm_ver = _run_check(["npm", "--version"])
+    if node_ver and npm_ver:
+        typer.echo(f"  ✅ Node.js {node_ver}（npm {npm_ver}）")
+        return True
+    typer.echo("  ❌ Node.js 未找到")
+    typer.echo("     大部分 ACP Agent CLI 需要 Node.js 才能安装和运行。")
+    typer.echo("     下载地址：https://nodejs.org/")
+    return False
+
+
+def _resolve_command(cmd: str) -> str | None:
+    """Return the resolved path of a command, or None if not found."""
+    resolved = which(cmd)
+    if resolved:
+        return resolved
+    if sys.platform == "win32":
+        for ext in (".cmd", ".ps1", ".bat"):
+            resolved = which(cmd + ext)
+            if resolved:
+                return resolved
+    return None
+
+
 @app.command()
 def init(
-    feishu_app_id: str = typer.Option(..., prompt=True, help="飞书应用 ID"),
-    feishu_app_secret: str = typer.Option(..., prompt=True, hide_input=True, help="飞书应用密钥"),
-    openai_api_key: str = typer.Option(
-        "",
-        prompt="OpenAI API 密钥（可留空，留空时使用本机 Codex 登录态）",
-        hide_input=True,
-        help="OpenAI API 密钥，可留空以复用本机 Codex 配置",
-    ),
-    openai_base_url: str = typer.Option("", help="OpenAI 兼容服务的 Base URL，可选"),
-    working_dir: Path = typer.Option(Path.cwd(), help="工作目录"),
-    idle_timeout_seconds: int = typer.Option(300, help="Agent 无响应超时时间（秒）"),
+    skip_checks: bool = typer.Option(False, "--skip-checks", help="跳过环境检查（非交互场景）"),
 ) -> None:
-    """初始化配置文件。"""
-    path = save_settings(
-        Settings(
-            feishu_app_id=feishu_app_id,
-            feishu_app_secret=feishu_app_secret,
-            openai_api_key=openai_api_key,
-            openai_base_url=openai_base_url or None,
-            working_dir=working_dir,
-            idle_timeout_seconds=idle_timeout_seconds,
-        )
+    """初始化配置文件（交互式向导）。
+
+    引导你完成环境检查、Agent 选择和飞书凭证配置，
+    将结果写入 ~/.lark-acp-bridge/config.toml 和 agents.json。
+    """
+    from ..config.settings import get_config_path
+
+    typer.echo("\n🚀  Lark ACP Bridge 初始化向导")
+    typer.echo("═" * 36)
+
+    # ── 1. 环境检查 ──────────────────────────────────────────────────────────
+    if not skip_checks:
+        typer.echo("\n🔍  检查运行环境...")
+        v = sys.version_info
+        typer.echo(f"  ✅ Python {v.major}.{v.minor}.{v.micro}")
+        has_node = _check_node()
+    else:
+        has_node = _run_check(["node", "--version"]) is not None
+
+    # ── 2. 选择 Agent ────────────────────────────────────────────────────────
+    typer.echo("\n─────────────────────────────────────")
+    typer.echo("🤖  选择 ACP Agent")
+    typer.echo("─────────────────────────────────────")
+    for i, p in enumerate(_AGENT_PRESETS, 1):
+        typer.echo(f"  {i}. {p['label']}")
+    typer.echo(f"  {len(_AGENT_PRESETS) + 1}. 跳过（稍后手动编辑 agents.json）")
+
+    choice = typer.prompt("选择", default="1", show_default=False)
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        idx = -1
+
+    selected_preset: dict | None = None
+    if 0 <= idx < len(_AGENT_PRESETS):
+        selected_preset = _AGENT_PRESETS[idx]
+    else:
+        typer.echo("  ⏭  跳过 Agent 配置，请稍后手动编辑 ~/.lark-acp-bridge/agents.json")
+
+    agent_name: str = ""
+    agent_env: dict[str, str] = {}
+    agent_installed = False
+
+    if selected_preset is not None:
+        name = selected_preset["name"]
+        command = selected_preset["command"]
+        agent_name = name
+
+        # Check if the CLI is already installed
+        typer.echo(f"\n  📦  检查 {command} ...")
+        resolved = _resolve_command(command)
+
+        if resolved:
+            typer.echo(f"  ✅ 已找到：{resolved}")
+            agent_installed = True
+        elif selected_preset["npm_pkg"] and has_node:
+            typer.echo(f"  ❌ 未检测到 {command}")
+            install = typer.confirm(f"  是否现在安装？（npm install -g {selected_preset['npm_pkg']}）", default=True)
+            if install:
+                typer.echo(f"  ▶ npm install -g {selected_preset['npm_pkg']}")
+                try:
+                    subprocess.run(
+                        ["npm", "install", "-g", selected_preset["npm_pkg"]],
+                        check=True,
+                        timeout=120,
+                    )
+                    # Verify after install
+                    if _resolve_command(command):
+                        typer.echo("  ✅ 安装完成")
+                        agent_installed = True
+                    else:
+                        typer.echo(f"  ⚠️  npm 安装完成，但未找到 {command} 命令，请检查 npm 全局 bin 目录是否在 PATH 中")
+                except subprocess.CalledProcessError as exc:
+                    typer.echo(f"  ❌ 安装失败（exit {exc.returncode}），请稍后手动安装")
+                except subprocess.TimeoutExpired:
+                    typer.echo("  ❌ 安装超时（120秒），请稍后手动安装")
+        elif selected_preset["command"] == "npx":
+            # npx is always available if node is installed
+            if has_node:
+                typer.echo("  ✅ npx 可用（首次使用时自动下载 agent 包）")
+                agent_installed = True
+            else:
+                typer.echo("  ❌ npx 不可用，请先安装 Node.js")
+
+        # Prompt for env key (API key)
+        if selected_preset["env_key"]:
+            api_key = typer.prompt(
+                f"\n  {selected_preset['env_prompt']}",
+                default="",
+                hide_input=True,
+            )
+            if api_key:
+                agent_env[selected_preset["env_key"]] = api_key
+
+    # ── 3. 飞书配置 ──────────────────────────────────────────────────────────
+    typer.echo("\n─────────────────────────────────────")
+    typer.echo("📱  飞书应用配置")
+    typer.echo("─────────────────────────────────────")
+    feishu_app_id = typer.prompt("  App ID（cli_xxxx）")
+    feishu_app_secret = typer.prompt("  App Secret", hide_input=True)
+
+    # ── 4. 工作目录 ──────────────────────────────────────────────────────────
+    typer.echo("\n─────────────────────────────────────")
+    working_dir_str = typer.prompt(
+        "📁  工作目录（留空使用当前目录）",
+        default=str(Path.cwd()),
+        show_default=False,
     )
-    typer.echo(f"配置已保存到 {path}")
+    working_dir = Path(working_dir_str) if working_dir_str else Path.cwd()
+
+    # ── 5. 保存 config.toml ──────────────────────────────────────────────────
+    settings = Settings(
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        working_dir=working_dir,
+    )
+    config_path = save_settings(settings)
+
+    # ── 6. 写入 agents.json ─────────────────────────────────────────────────
+    agents_json_path = get_agents_json_path(config_path)
+    agents_json_written = False
+
+    if selected_preset is not None:
+        if agents_json_path.exists():
+            overwrite = typer.confirm(f"\n  {agents_json_path} 已存在，是否覆盖？", default=False)
+            if not overwrite:
+                typer.echo("  ⏭  跳过 agents.json，保留现有配置")
+                selected_preset = None  # skip writing
+
+        if selected_preset is not None:
+            agents_data: dict = {
+                "active": agent_name,
+                "agent_servers": {
+                    agent_name: {
+                        "command": selected_preset["command"],
+                        "args": selected_preset["args"],
+                        "description": selected_preset["description"],
+                    }
+                },
+            }
+            if agent_env:
+                agents_data["agent_servers"][agent_name]["env"] = agent_env
+
+            agents_json_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(agents_json_path, "w", encoding="utf-8") as f:
+                json.dump(agents_data, f, indent=2, ensure_ascii=False)
+            agents_json_written = True
+
+    # ── 7. 输出结果 ──────────────────────────────────────────────────────────
+    typer.echo("\n─────────────────────────────────────")
+    typer.echo("✅  配置已写入：")
+    typer.echo(f"   {config_path}")
+    if agents_json_written:
+        typer.echo(f"   {agents_json_path}")
+
+    if selected_preset and not agent_installed:
+        typer.echo(f"\n⚠️  注意：{selected_preset['command']} 尚未安装，启动服务前请先确保已安装。")
+
+    typer.echo("\n🚀  下一步：运行  lark-acp-bridge start")
+    typer.echo()
 
 
 @app.command()
