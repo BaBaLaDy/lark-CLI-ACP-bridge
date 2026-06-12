@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from shutil import which
 
@@ -26,6 +28,84 @@ logger = structlog.get_logger()
 app = typer.Typer(name="lark-acp-bridge", help="飞书与 ACP Agent 的桥接工具", add_completion=False)
 daemon_app = typer.Typer(name="daemon", help="管理系统服务（可选 daemon 模式）")
 app.add_typer(daemon_app)
+
+# ---------------------------------------------------------------------------
+# PID file — ensures only one instance runs at a time
+# ---------------------------------------------------------------------------
+
+_PID_FILE = Path.home() / ".lark-acp-bridge" / "bridge.pid"
+
+
+def _kill_previous_instance() -> None:
+    """Terminate any previously running bridge instance before starting this one.
+
+    Reads the PID from the PID file, sends SIGTERM (or taskkill on Windows),
+    waits up to 5 seconds for graceful exit, then force-kills if still alive.
+    Cleans up stale PID files pointing to non-existent processes.
+    """
+    if not _PID_FILE.exists():
+        return
+
+    try:
+        old_pid = int(_PID_FILE.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        _PID_FILE.unlink(missing_ok=True)
+        return
+
+    # Don't kill ourselves
+    if old_pid == os.getpid():
+        return
+
+    # Check if the process is still running
+    try:
+        os.kill(old_pid, 0)  # signal 0 = check existence, no actual signal
+    except OSError:
+        # Process doesn't exist — stale PID file
+        _PID_FILE.unlink(missing_ok=True)
+        return
+
+    logger.info("killing-previous-instance", pid=old_pid)
+    typer.echo(f"[start] 正在关闭上一个实例 (PID {old_pid})...")
+
+    # Send termination signal
+    try:
+        if sys.platform == "win32":
+            # On Windows, os.kill(pid, SIGTERM) calls TerminateProcess — immediate kill.
+            # This is the most reliable way to stop a console Python process.
+            os.kill(old_pid, signal.SIGTERM)
+        else:
+            os.kill(old_pid, signal.SIGTERM)
+            # On Unix, SIGTERM is asynchronous — wait for graceful exit.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(old_pid, 0)
+                    time.sleep(0.2)
+                except OSError:
+                    break  # Process is gone
+            else:
+                logger.warning("force-killing-previous-instance", pid=old_pid)
+                try:
+                    os.kill(old_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    _PID_FILE.unlink(missing_ok=True)
+    typer.echo("[start] 上一个实例已关闭")
+
+
+def _write_pid_file() -> None:
+    """Write the current process PID to the PID file."""
+    _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _remove_pid_file() -> None:
+    """Remove the PID file on clean shutdown."""
+    _PID_FILE.unlink(missing_ok=True)
+
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +419,10 @@ def start(
         _start_daemon(settings, mode, webhook_port, resolved_agent_command, resolved_agent_env)
         return
 
+    # -- Kill any previous bridge instance before starting this one -----------
+    _kill_previous_instance()
+    _write_pid_file()
+
     async def run_bridge() -> None:
         # Build AgentManager if agents are configured in agents.json
         agents_json_path = get_agents_json_path()
@@ -416,6 +500,7 @@ def start(
             await bridge.stop()
         if agent_manager is not None:
             await agent_manager.stop_all()
+        _remove_pid_file()
         logger.info("shutdown-complete")
 
     _run_async(run_bridge())
